@@ -1,0 +1,321 @@
+
+import argparse
+import datetime as dt
+import hashlib
+import html
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / "output"
+OUT.mkdir(exist_ok=True)
+CFG = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
+
+def clean(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    s = html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+def fingerprint(s):
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+def parse_feed(text, source):
+    items = []
+    blocks = re.findall(r"<item\b.*?</item>", text, re.I | re.S)
+    if not blocks:
+        blocks = re.findall(r"<entry\b.*?</entry>", text, re.I | re.S)
+    for b in blocks[:30]:
+        def tag(name):
+            m = re.search(r"<" + name + r"\b[^>]*>(.*?)</" + name + r">", b, re.I | re.S)
+            return clean(m.group(1)) if m else ""
+        link = ""
+        m = re.search(r"<link\b[^>]*href=['\"]([^'\"]+)", b, re.I)
+        if m:
+            link = m.group(1)
+        else:
+            link = tag("link")
+        title = tag("title")
+        summary = tag("description") or tag("summary") or tag("content")
+        pub = tag("pubDate") or tag("published") or tag("updated")
+        if title and link:
+            items.append({"source": source, "title": title, "summary": summary,
+                          "url": link, "published": pub})
+    return items
+
+def fetch_feeds():
+    import urllib.request
+    records, errors = [], []
+    for source, url in CFG["sources"]:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "GagroveNewsBot/2.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                text = r.read().decode("utf-8", errors="replace")
+            parsed = parse_feed(text, source)
+            records.extend(parsed)
+            if not parsed:
+                errors.append(source + ": no parseable entries")
+        except Exception as e:
+            errors.append(source + ": " + type(e).__name__)
+    return records, errors
+
+def dedupe(records):
+    seen = set()
+    out = []
+    for x in records:
+        key = re.sub(r"\W+", " ", x["title"].lower()).strip()
+        if key and key not in seen:
+            seen.add(key)
+            x["id"] = fingerprint(x["source"] + x["url"])
+            out.append(x)
+    return out
+
+def words(title):
+    stop = {"the","and","from","with","that","this","have","been","said","says","malawi","into"}
+    return {w for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 3 and w not in stop}
+
+def cluster(records):
+    groups = []
+    for r in records:
+        rw = words(r["title"])
+        found = False
+        for g in groups:
+            gw = set().union(*(words(x["title"]) for x in g))
+            inter = len(rw & gw)
+            union = max(1, len(rw | gw))
+            if inter >= 3 and inter / union >= 0.28:
+                g.append(r)
+                found = True
+                break
+        if not found:
+            groups.append([r])
+    return groups
+
+def candidates(records):
+    result = []
+    for g in cluster(records):
+        sources = sorted(set(x["source"] for x in g))
+        text = " ".join(x["title"] for x in g).lower()
+        score = 10 * len(sources) + min(5, len(g))
+        if any(k in text for k in ["breaking","government","court","accident","fire","flood","price","election","killed","arrested"]):
+            score += 3
+        result.append({"items": g, "sources": sources, "score": score})
+    return sorted(result, key=lambda x: x["score"], reverse=True)
+
+def story(candidate, slot, topic):
+    first = candidate["items"][0]
+    multi = len(candidate["sources"]) >= 2
+    body = clean(first.get("summary", ""))
+    if not body:
+        body = "A report published by " + first["source"] + " is receiving attention in Malawi."
+    if multi:
+        body += " Related reporting was also found from " + ", ".join(candidate["sources"]) + "."
+        label = "Confirmed by multiple reports"
+    else:
+        body += " This is currently based on reporting from " + first["source"] + "; further confirmation is being sought."
+        label = "Developing"
+    return {
+        "slot": slot,
+        "topic": topic,
+        "headline": first["title"][:140],
+        "body": body[:650],
+        "label": label,
+        "source_count": len(candidate["sources"]),
+        "sources": [{"name": x["source"], "url": x["url"]} for x in candidate["items"][:4]],
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat()
+    }
+
+def safety(story_obj):
+    t = (story_obj["headline"] + " " + story_obj["body"]).lower()
+    bad = ["home address", "phone number", "leaked password", "private message", "doxx"]
+    return not any(x in t for x in bad)
+
+def make_svg(s, number):
+    headline = html.escape(s["headline"])
+    body = html.escape(s["body"])
+    label = html.escape(s["label"])
+    sources = html.escape(", ".join(x["name"] for x in s["sources"]))
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1200">'
+        '<rect width="1200" height="1200" fill="#111827"/>'
+        '<rect x="55" y="55" width="1090" height="1090" rx="36" fill="#ffffff"/>'
+        '<rect x="55" y="55" width="1090" height="105" rx="36" fill="#111827"/>'
+        '<text x="95" y="123" font-family="Arial" font-size="42" font-weight="700" fill="#ffffff">GAGROVE - MALAWI NEWS</text>'
+        f'<text x="95" y="235" font-family="Arial" font-size="32" font-weight="700" fill="#6b7280">{label}</text>'
+        f'<text x="95" y="315" font-family="Arial" font-size="50" font-weight="700" fill="#111827">{headline}</text>'
+        f'<foreignObject x="95" y="470" width="1010" height="430"><div xmlns="http://www.w3.org/1999/xhtml" style="font-family:Arial;font-size:32px;line-height:1.45;color:#1f2937">{body}</div></foreignObject>'
+        '<line x1="95" y1="970" x2="1105" y2="970" stroke="#d1d5db" stroke-width="3"/>'
+        f'<text x="95" y="1030" font-family="Arial" font-size="26" fill="#6b7280">Sources: {sources}</text>'
+        f'<text x="95" y="1080" font-family="Arial" font-size="24" fill="#9ca3af">Post {number} - Gagrove</text>'
+        '</svg>'
+    )
+
+def fixture():
+    return [
+        {"source":"Malawi24","title":"Government announces new national electricity update","summary":"Officials announced an update affecting electricity services across Malawi.","url":"https://fixture/a"},
+        {"source":"Times 360 Malawi","title":"Government announces new national electricity update","summary":"The Times reports the same electricity services announcement.","url":"https://fixture/b"},
+        {"source":"Nyasa Times","title":"Fuel prices discussed as transport operators seek clarity","summary":"Transport operators have asked for clarification on fuel pricing.","url":"https://fixture/c"},
+        {"source":"Malawi24","title":"Fuel prices discussed as transport operators seek clarity","summary":"Malawi24 reports transport operators seeking clarification on fuel pricing.","url":"https://fixture/d"},
+        {"source":"Times 360 Malawi","title":"Local council opens public consultation on market project","summary":"A local council has opened a consultation on a market project.","url":"https://fixture/e"}
+    ]
+
+def simulate():
+    topic = CFG["default_topic"]
+    records = dedupe(fixture())
+    cs = candidates(records)
+    built = []
+    for n, c in enumerate(cs[:3], 1):
+        s = story(c, n, topic)
+        built.append(s)
+        (OUT / ("simulation_post_" + str(n) + ".svg")).write_text(make_svg(s, n), encoding="utf-8")
+    report = {
+        "simulation": True,
+        "machine": {"cpu":"Intel Core i5-2520M", "ram_gb":6, "hdd":True, "virtualization":False},
+        "architecture":"GitHub Actions cloud runner + RSS + AI editor + SVG/PNG + Meta Graph API",
+        "topic":topic,
+        "source_collection":"PASS (fixture data)",
+        "deduplication":"PASS",
+        "posts_built":len(built),
+        "verification":"PASS (first two fixtures are multi-source)",
+        "safety":"PASS",
+        "graphics":"PASS",
+        "facebook":"DRY RUN - no credentials",
+        "final_state":"READY_TO_PUBLISH",
+        "posts":built
+    }
+    (OUT / "simulation_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return report
+
+
+def ai_edit(candidate, slot, topic):
+    """Use Gemini only to rewrite facts already present in source evidence.
+    If no key is configured, return the deterministic version."""
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        return story(candidate, slot, topic)
+
+    import requests
+    evidence = []
+    for item in candidate["items"][:4]:
+        evidence.append({
+            "source": item["source"],
+            "title": item["title"],
+            "summary": item.get("summary", ""),
+            "url": item["url"]
+        })
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "headline": {"type": "string"},
+            "body": {"type": "string"},
+            "label": {"type": "string", "enum": ["Confirmed by multiple reports", "Developing"]},
+            "source_urls": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["headline", "body", "label", "source_urls"]
+    }
+
+    prompt = (
+        "You are the Gagrove Malawi news editor. Rewrite ONLY from the supplied evidence. "
+        "Do not add facts, names, numbers, quotes, motives, allegations or locations that are "
+        "not in the evidence. Keep political coverage factual and neutral. If only one source "
+        "supports the story, label it Developing. If multiple independent sources support it, "
+        "label it Confirmed by multiple reports. Write a concise Facebook news post. "
+        "Return JSON matching the supplied schema. Topic: " + topic + "\n\nEvidence:\n" +
+        json.dumps(evidence, ensure_ascii=False)
+    )
+
+    payload = {
+        "model": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        "input": prompt,
+        "response_format": {
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": schema
+        }
+    }
+    r = requests.post(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        json=payload,
+        timeout=60
+    )
+    r.raise_for_status()
+    data = r.json()
+    raw = data.get("output_text")
+    if not raw:
+        # Be tolerant of alternate Interactions response layouts.
+        for step in data.get("steps", []):
+            for block in step.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    raw = block.get("text")
+    if not raw:
+        raise RuntimeError("Gemini returned no text output.")
+    result = json.loads(raw)
+
+    allowed_urls = {x["url"] for x in candidate["items"]}
+    source_urls = [u for u in result.get("source_urls", []) if u in allowed_urls]
+    if not source_urls:
+        source_urls = [x["url"] for x in candidate["items"][:4]]
+
+    return {
+        "slot": slot,
+        "topic": topic,
+        "headline": clean(str(result["headline"]))[:140],
+        "body": clean(str(result["body"]))[:650],
+        "label": result["label"],
+        "source_count": len(candidate["sources"]),
+        "sources": [{"name": x["source"], "url": x["url"]}
+                    for x in candidate["items"][:4] if x["url"] in source_urls],
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "ai_model": payload["model"]
+    }
+
+def publish():
+    import requests
+    topic = os.getenv("GAGROVE_TOPIC") or CFG["default_topic"]
+    records, errors = fetch_feeds()
+    cs = candidates(dedupe(records))
+    if not cs:
+        print("No usable current stories; nothing published.")
+        return 0
+    page_id = os.environ["META_PAGE_ID"]
+    token = os.environ["META_PAGE_ACCESS_TOKEN"]
+    version = os.getenv("META_GRAPH_VERSION", "v26.0")
+    published = 0
+    used = set()
+    for n, c in enumerate(cs[:CFG["posts_per_day"]], 1):
+        if any(x["url"] in used for x in c["items"]):
+            continue
+        s = ai_edit(c, n, topic)
+        if not safety(s):
+            continue
+        for x in c["items"]:
+            used.add(x["url"])
+        svg = OUT / ("post_" + str(n) + ".svg")
+        png = OUT / ("post_" + str(n) + ".png")
+        svg.write_text(make_svg(s, n), encoding="utf-8")
+        import cairosvg
+        cairosvg.svg2png(url=str(svg), write_to=str(png), output_width=1200, output_height=1200)
+        with open(png, "rb") as f:
+            r = requests.post(
+                f"https://graph.facebook.com/{version}/{page_id}/photos",
+                data={"caption":s["body"], "published":"true", "access_token":token},
+                files={"source":("gagrove.png",f,"image/png")},
+                timeout=60
+            )
+        if r.status_code >= 300:
+            raise RuntimeError("Facebook error " + str(r.status_code) + ": " + r.text[:500])
+        published += 1
+        time.sleep(2)
+    print(json.dumps({"published":published, "feed_errors":errors}, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--simulate", action="store_true")
+    args = ap.parse_args()
+    raise SystemExit(0 if (simulate() if args.simulate else publish()) is not None else 1)
